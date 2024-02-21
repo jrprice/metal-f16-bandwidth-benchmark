@@ -1,0 +1,5 @@
+benchmark
+shaders.metallib
+.cache
+*.code-workspace
+compile_commands.json
