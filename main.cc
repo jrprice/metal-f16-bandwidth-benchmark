@@ -12,10 +12,20 @@
 #define GROUP_HEIGHT 16
 #define ITERATIONS 5000
 
-// List of kernel functions to benchmark.
-const char *kBenchmarks[] = {
-    "texture_float",
-    "texture_half",
+// A benchmark config.
+struct Benchmark {
+  const char *name = nullptr;
+  enum OutputType {
+    kBuffer,
+    kTexture,
+  } output_type;
+};
+
+// List of benchmarks.
+Benchmark kBenchmarks[] = {
+    {.name = "buffer", .output_type = Benchmark::kBuffer},
+    {.name = "texture_float", .output_type = Benchmark::kTexture},
+    {.name = "texture_half", .output_type = Benchmark::kTexture},
 };
 
 using namespace std;
@@ -41,10 +51,12 @@ class Context {
 private:
   MTL::Device *device_;
   MTL::CommandQueue *queue_;
+  MTL::Buffer *staging_buffer_;
   MTL::Buffer *output_buffer_;
-  MTL::Texture *texture_;
+  MTL::Texture *output_texture_;
   MTL::Library *library_;
-  MTL::ComputePipelineState *copy_pipeline_;
+  MTL::ComputePipelineState *copy_from_buffer_;
+  MTL::ComputePipelineState *copy_from_texture_;
 
   const uint16_t kInputValueHalf[4] = {0x5140, 0xC000, 0x6400, 0xE212};
   const float kInputValueFloat[4] = {42, -2, 1024, -777};
@@ -88,9 +100,13 @@ public:
       return false;
     }
 
-    // Create the copy pipeline used to check the results.
-    copy_pipeline_ = MakePipeline("copy");
-    if (!copy_pipeline_) {
+    // Create the copy pipelines used to check the results.
+    copy_from_buffer_ = MakePipeline("copy_from_buffer");
+    if (!copy_from_buffer_) {
+      return false;
+    }
+    copy_from_texture_ = MakePipeline("copy_from_texture");
+    if (!copy_from_texture_) {
       return false;
     }
 
@@ -101,15 +117,23 @@ public:
   /// @returns true on success, false on failure
   bool InitResources() {
     // Create the output buffer used to transfer the output for verification.
-    output_buffer_ =
+    staging_buffer_ =
         device_->newBuffer(WIDTH * HEIGHT * 16, MTL::ResourceStorageModeShared);
+    if (!staging_buffer_) {
+      cerr << "Failed to create output buffer\n";
+      return false;
+    }
+    memset(staging_buffer_->contents(), 0, WIDTH * HEIGHT * 16);
+
+    // Create the output buffer used for benchmarks that write to buffers.
+    output_buffer_ =
+        device_->newBuffer(WIDTH * HEIGHT * 8, MTL::ResourceStorageModePrivate);
     if (!output_buffer_) {
       cerr << "Failed to create output buffer\n";
       return false;
     }
-    memset(output_buffer_->contents(), 0, WIDTH * HEIGHT * 16);
 
-    // Create an f16 texture.
+    // Create the f16 output texture used for benchmarks that write to textures.
     auto *descriptor = MTL::TextureDescriptor::alloc();
     descriptor->init();
     descriptor->setTextureType(MTL::TextureType2D);
@@ -118,8 +142,8 @@ public:
     descriptor->setHeight(HEIGHT);
     descriptor->setUsage(MTL::TextureUsageShaderRead |
                          MTL::TextureUsageShaderWrite);
-    texture_ = device_->newTexture(descriptor);
-    if (!texture_) {
+    output_texture_ = device_->newTexture(descriptor);
+    if (!output_texture_) {
       cerr << "Failed to create the texture\n";
       return false;
     }
@@ -148,13 +172,13 @@ public:
     return pipeline;
   }
 
-  /// Benchmark a kernel function.
-  /// @param func_name the name of the kernel function
+  /// Run a benchmark.
+  /// @param benchmark the benchmark config to run
   /// @returns true on success, false on failure
-  bool RunBenchmark(const char *func_name) {
-    cout << "\nRunning '" << func_name << "'\n";
+  bool RunBenchmark(const Benchmark &benchmark) {
+    cout << "\nRunning '" << benchmark.name << "'\n";
 
-    auto *pipeline = MakePipeline(func_name);
+    auto *pipeline = MakePipeline(benchmark.name);
     if (!pipeline) {
       return false;
     }
@@ -176,7 +200,14 @@ public:
     auto group_size = MTL::Size(GROUP_WIDTH, GROUP_HEIGHT, 1);
     compute_encoder->setComputePipelineState(pipeline);
     compute_encoder->setBytes(kInputValueHalf, 8, 0);
-    compute_encoder->setTexture(texture_, 0);
+    switch (benchmark.output_type) {
+    case Benchmark::kBuffer:
+      compute_encoder->setBuffer(output_buffer_, 0, 1);
+      break;
+    case Benchmark::kTexture:
+      compute_encoder->setTexture(output_texture_, 0);
+      break;
+    }
     for (uint32_t i = 0; i < ITERATIONS; i++) {
       compute_encoder->dispatchThreads(grid_size, group_size);
     }
@@ -195,12 +226,12 @@ public:
     cout << "  Bandwidth = " << (total_bytes / duration_per_call) / 1e9
          << " GB/s\n";
 
-    return Check();
+    return Check(benchmark.output_type);
   }
 
   /// Check the contents of texture.
   /// @returns true on success, false on verification failure
-  bool Check() {
+  bool Check(Benchmark::OutputType output_type) {
     auto *command_buffer = queue_->commandBuffer();
     if (!command_buffer) {
       cerr << "Failed to create a command buffer\n";
@@ -216,9 +247,18 @@ public:
     // Dispatch the function to copy texture data to a buffer.
     auto grid_size = MTL::Size(WIDTH, HEIGHT, 1);
     auto group_size = MTL::Size(GROUP_WIDTH, GROUP_HEIGHT, 1);
-    compute_encoder->setComputePipelineState(copy_pipeline_);
-    compute_encoder->setBuffer(output_buffer_, 0, 0);
-    compute_encoder->setTexture(texture_, 0);
+    switch (output_type) {
+    case Benchmark::kBuffer:
+      compute_encoder->setComputePipelineState(copy_from_buffer_);
+      compute_encoder->setBuffer(output_buffer_, 0, 0);
+      compute_encoder->setBuffer(staging_buffer_, 0, 1);
+      break;
+    case Benchmark::kTexture:
+      compute_encoder->setComputePipelineState(copy_from_texture_);
+      compute_encoder->setBuffer(staging_buffer_, 0, 0);
+      compute_encoder->setTexture(output_texture_, 0);
+      break;
+    }
     compute_encoder->dispatchThreads(grid_size, group_size);
     compute_encoder->endEncoding();
     command_buffer->commit();
@@ -226,7 +266,7 @@ public:
 
     // Check all entries in the buffer.
     bool correct = true;
-    float *result = static_cast<float *>(output_buffer_->contents());
+    float *result = static_cast<float *>(staging_buffer_->contents());
     for (uint32_t y = 0; y < HEIGHT && correct; y++) {
       for (uint32_t x = 0; x < WIDTH && correct; x++) {
         for (uint32_t c = 0; c < 4; c++) {
@@ -248,8 +288,8 @@ int main(int argc, const char *argv[]) {
     return 1;
   }
 
-  for (auto *name : kBenchmarks) {
-    if (!context.RunBenchmark(name)) {
+  for (auto &benchmark : kBenchmarks) {
+    if (!context.RunBenchmark(benchmark)) {
       return 1;
     }
   }
