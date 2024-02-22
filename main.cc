@@ -14,18 +14,45 @@
 
 // A benchmark config.
 struct Benchmark {
-  const char *name = nullptr;
-  enum OutputType {
+  enum ResourceType {
+    kBytes,
     kBuffer,
     kTexture,
-  } output_type;
+  };
+
+  const char *name = nullptr;
+  const char *func = nullptr;
+  ResourceType input_type;
+  ResourceType output_type;
 };
 
 // List of benchmarks.
 Benchmark kBenchmarks[] = {
-    {.name = "buffer", .output_type = Benchmark::kBuffer},
-    {.name = "texture_float", .output_type = Benchmark::kTexture},
-    {.name = "texture_half", .output_type = Benchmark::kTexture},
+    {.name = "Write to buffer",
+     .func = "write_buffer",
+     .input_type = Benchmark::kBytes,
+     .output_type = Benchmark::kBuffer},
+    {.name = "Write to texture<float>",
+     .func = "write_texture_float",
+     .input_type = Benchmark::kBytes,
+     .output_type = Benchmark::kTexture},
+    {.name = "Write to texture<half>",
+     .func = "write_texture_half",
+     .input_type = Benchmark::kBytes,
+     .output_type = Benchmark::kTexture},
+
+    {.name = "Read from buffer (copy to buffer)",
+     .func = "read_buffer",
+     .input_type = Benchmark::kBuffer,
+     .output_type = Benchmark::kBuffer},
+    {.name = "Read from texture<float> (copy to buffer)",
+     .func = "read_texture_float",
+     .input_type = Benchmark::kTexture,
+     .output_type = Benchmark::kBuffer},
+    {.name = "Read from texture<half> (copy to buffer)",
+     .func = "read_texture_half",
+     .input_type = Benchmark::kTexture,
+     .output_type = Benchmark::kBuffer},
 };
 
 using namespace std;
@@ -52,7 +79,9 @@ private:
   MTL::Device *device_;
   MTL::CommandQueue *queue_;
   MTL::Buffer *staging_buffer_;
+  MTL::Buffer *input_buffer_;
   MTL::Buffer *output_buffer_;
+  MTL::Texture *input_texture_;
   MTL::Texture *output_texture_;
   MTL::Library *library_;
   MTL::ComputePipelineState *copy_from_buffer_;
@@ -125,6 +154,14 @@ public:
     }
     memset(staging_buffer_->contents(), 0, WIDTH * HEIGHT * 16);
 
+    // Create the input buffer used for benchmarks that read from buffers.
+    input_buffer_ =
+        device_->newBuffer(WIDTH * HEIGHT * 8, MTL::ResourceStorageModePrivate);
+    if (!input_buffer_) {
+      cerr << "Failed to create input buffer\n";
+      return false;
+    }
+
     // Create the output buffer used for benchmarks that write to buffers.
     output_buffer_ =
         device_->newBuffer(WIDTH * HEIGHT * 8, MTL::ResourceStorageModePrivate);
@@ -133,7 +170,7 @@ public:
       return false;
     }
 
-    // Create the f16 output texture used for benchmarks that write to textures.
+    // Create the textures.
     auto *descriptor = MTL::TextureDescriptor::alloc();
     descriptor->init();
     descriptor->setTextureType(MTL::TextureType2D);
@@ -142,11 +179,45 @@ public:
     descriptor->setHeight(HEIGHT);
     descriptor->setUsage(MTL::TextureUsageShaderRead |
                          MTL::TextureUsageShaderWrite);
-    output_texture_ = device_->newTexture(descriptor);
-    if (!output_texture_) {
-      cerr << "Failed to create the texture\n";
+    input_texture_ = device_->newTexture(descriptor);
+    if (!input_texture_) {
+      cerr << "Failed to create the input texture\n";
       return false;
     }
+    output_texture_ = device_->newTexture(descriptor);
+    if (!output_texture_) {
+      cerr << "Failed to create the output texture\n";
+      return false;
+    }
+
+    // Fill the input buffer.
+    auto *fill_buffer_pipeline = MakePipeline("write_buffer");
+    if (!fill_buffer_pipeline) {
+      return false;
+    }
+    auto *command_buffer =
+        RunPipeline(1, [&](MTL::ComputeCommandEncoder *encoder) {
+          encoder->setComputePipelineState(fill_buffer_pipeline);
+          encoder->setBytes(kInputValueHalf, 8, 0);
+          encoder->setBuffer(input_buffer_, 0, 1);
+          return true;
+        });
+    command_buffer->release();
+    fill_buffer_pipeline->release();
+
+    // Fill the input texture.
+    auto *fill_texture_pipeline = MakePipeline("write_texture_half");
+    if (!fill_texture_pipeline) {
+      return false;
+    }
+    command_buffer = RunPipeline(1, [&](MTL::ComputeCommandEncoder *encoder) {
+      encoder->setComputePipelineState(fill_texture_pipeline);
+      encoder->setBytes(kInputValueHalf, 8, 0);
+      encoder->setTexture(input_texture_, 0);
+      return true;
+    });
+    command_buffer->release();
+    fill_texture_pipeline->release();
 
     return true;
   }
@@ -172,48 +243,91 @@ public:
     return pipeline;
   }
 
+  /// Run a pipeline.
+  /// @param iterations the number of iterations to run
+  /// @param set_resources a callback that sets the resources on the encoder
+  /// @returns true on success, false on failure
+  MTL::CommandBuffer *
+  RunPipeline(uint32_t iterations,
+              const std::function<bool(MTL::ComputeCommandEncoder *encoder)>
+                  &set_resources) {
+    auto *command_buffer = queue_->commandBuffer();
+    if (!command_buffer) {
+      cerr << "Failed to create a command buffer\n";
+      return nullptr;
+    }
+
+    auto *compute_encoder = command_buffer->computeCommandEncoder();
+    if (!compute_encoder) {
+      cerr << "Failed to create a compute command encoder\n";
+      return nullptr;
+    }
+
+    // Set up the dispatch resources.
+    if (!set_resources(compute_encoder)) {
+      return nullptr;
+    }
+
+    // Dispatch `iterations` instances of the pipeline.
+    auto grid_size = MTL::Size(WIDTH, HEIGHT, 1);
+    auto group_size = MTL::Size(GROUP_WIDTH, GROUP_HEIGHT, 1);
+    for (uint32_t i = 0; i < iterations; i++) {
+      compute_encoder->dispatchThreads(grid_size, group_size);
+    }
+
+    compute_encoder->endEncoding();
+    command_buffer->commit();
+    command_buffer->waitUntilCompleted();
+
+    compute_encoder->release();
+
+    return command_buffer;
+  }
+
   /// Run a benchmark.
   /// @param benchmark the benchmark config to run
   /// @returns true on success, false on failure
   bool RunBenchmark(const Benchmark &benchmark) {
     cout << "\nRunning '" << benchmark.name << "'\n";
 
-    auto *pipeline = MakePipeline(benchmark.name);
+    auto *pipeline = MakePipeline(benchmark.func);
     if (!pipeline) {
       return false;
     }
 
-    auto *command_buffer = queue_->commandBuffer();
-    if (!command_buffer) {
-      cerr << "Failed to create a command buffer\n";
-      return false;
-    }
+    auto *command_buffer =
+        RunPipeline(ITERATIONS, [&](MTL::ComputeCommandEncoder *encoder) {
+          encoder->setComputePipelineState(pipeline);
 
-    auto *compute_encoder = command_buffer->computeCommandEncoder();
-    if (!compute_encoder) {
-      cerr << "Failed to create a compute command encoder\n";
-      return false;
-    }
+          uint32_t buffer_index = 0;
+          uint32_t texture_index = 0;
 
-    // Dispatch ITERATIONS instances of the kernel function.
-    auto grid_size = MTL::Size(WIDTH, HEIGHT, 1);
-    auto group_size = MTL::Size(GROUP_WIDTH, GROUP_HEIGHT, 1);
-    compute_encoder->setComputePipelineState(pipeline);
-    compute_encoder->setBytes(kInputValueHalf, 8, 0);
-    switch (benchmark.output_type) {
-    case Benchmark::kBuffer:
-      compute_encoder->setBuffer(output_buffer_, 0, 1);
-      break;
-    case Benchmark::kTexture:
-      compute_encoder->setTexture(output_texture_, 0);
-      break;
-    }
-    for (uint32_t i = 0; i < ITERATIONS; i++) {
-      compute_encoder->dispatchThreads(grid_size, group_size);
-    }
-    compute_encoder->endEncoding();
-    command_buffer->commit();
-    command_buffer->waitUntilCompleted();
+          switch (benchmark.input_type) {
+          case Benchmark::kBuffer:
+            encoder->setBuffer(input_buffer_, 0, buffer_index++);
+            break;
+          case Benchmark::kTexture:
+            encoder->setTexture(input_texture_, texture_index++);
+            break;
+          case Benchmark::kBytes:
+            encoder->setBytes(kInputValueHalf, 8, buffer_index++);
+            break;
+          }
+
+          switch (benchmark.output_type) {
+          case Benchmark::kBuffer:
+            encoder->setBuffer(output_buffer_, 0, buffer_index++);
+            break;
+          case Benchmark::kTexture:
+            encoder->setTexture(output_texture_, texture_index++);
+            break;
+          case Benchmark::kBytes:
+            cerr << "Invalid output type 'bytes'\n";
+            return false;
+          }
+
+          return true;
+        });
 
     // Display the performance.
     double start = command_buffer->GPUStartTime();
@@ -221,48 +335,42 @@ public:
     double duration_total = end - start;
     double duration_per_call = duration_total / ITERATIONS;
     double total_bytes = WIDTH * HEIGHT * 8;
+    if (benchmark.input_type != Benchmark::kBytes) {
+      total_bytes *= 2;
+    }
     cout << "  Total runtime = " << 1000 * duration_total << "ms\n";
     cout << "  Runtime per dispatch = " << (1000 * duration_per_call) << "ms\n";
     cout << "  Bandwidth = " << (total_bytes / duration_per_call) / 1e9
          << " GB/s\n";
+
+    command_buffer->release();
+    pipeline->release();
 
     return Check(benchmark.output_type);
   }
 
   /// Check the contents of texture.
   /// @returns true on success, false on verification failure
-  bool Check(Benchmark::OutputType output_type) {
-    auto *command_buffer = queue_->commandBuffer();
-    if (!command_buffer) {
-      cerr << "Failed to create a command buffer\n";
-      return false;
-    }
-
-    auto *compute_encoder = command_buffer->computeCommandEncoder();
-    if (!compute_encoder) {
-      cerr << "Failed to create a compute command encoder\n";
-      return false;
-    }
-
-    // Dispatch the function to copy texture data to a buffer.
-    auto grid_size = MTL::Size(WIDTH, HEIGHT, 1);
-    auto group_size = MTL::Size(GROUP_WIDTH, GROUP_HEIGHT, 1);
-    switch (output_type) {
-    case Benchmark::kBuffer:
-      compute_encoder->setComputePipelineState(copy_from_buffer_);
-      compute_encoder->setBuffer(output_buffer_, 0, 0);
-      compute_encoder->setBuffer(staging_buffer_, 0, 1);
-      break;
-    case Benchmark::kTexture:
-      compute_encoder->setComputePipelineState(copy_from_texture_);
-      compute_encoder->setBuffer(staging_buffer_, 0, 0);
-      compute_encoder->setTexture(output_texture_, 0);
-      break;
-    }
-    compute_encoder->dispatchThreads(grid_size, group_size);
-    compute_encoder->endEncoding();
-    command_buffer->commit();
-    command_buffer->waitUntilCompleted();
+  bool Check(Benchmark::ResourceType output_type) {
+    auto *command_buffer =
+        RunPipeline(1, [&](MTL::ComputeCommandEncoder *encoder) {
+          switch (output_type) {
+          case Benchmark::kBuffer:
+            encoder->setComputePipelineState(copy_from_buffer_);
+            encoder->setBuffer(output_buffer_, 0, 0);
+            encoder->setBuffer(staging_buffer_, 0, 1);
+            return true;
+          case Benchmark::kTexture:
+            encoder->setComputePipelineState(copy_from_texture_);
+            encoder->setBuffer(staging_buffer_, 0, 0);
+            encoder->setTexture(output_texture_, 0);
+            return true;
+          case Benchmark::kBytes:
+            cerr << "Invalid output type 'bytes'\n";
+            return false;
+          }
+        });
+    command_buffer->release();
 
     // Check all entries in the buffer.
     bool correct = true;
